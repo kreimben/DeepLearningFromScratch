@@ -1,5 +1,6 @@
 # coding: utf-8
 import sys
+
 sys.path.append('..')
 import os
 from common.np import *
@@ -121,7 +122,7 @@ def create_co_matrix(corpus, vocab_size, window_size=1):
     return co_matrix
 
 
-def ppmi(C, verbose=False, eps = 1e-8):
+def ppmi(C, verbose=False, eps=1e-8):
     '''PPMI（正の相互情報量）の作成
 
     :param C: 共起行列
@@ -136,13 +137,13 @@ def ppmi(C, verbose=False, eps = 1e-8):
 
     for i in range(C.shape[0]):
         for j in range(C.shape[1]):
-            pmi = np.log2(C[i, j] * N / (S[j]*S[i]) + eps)
+            pmi = np.log2(C[i, j] * N / (S[j] * S[i]) + eps)
             M[i, j] = max(0, pmi)
 
             if verbose:
                 cnt += 1
-                if cnt % (total//100 + 1) == 0:
-                    print('%.1f%% done' % (100*cnt/total))
+                if cnt % (total // 100 + 1) == 0:
+                    print('%.1f%% done' % (100 * cnt / total))
     return M
 
 
@@ -156,7 +157,7 @@ def create_contexts_target(corpus, window_size=1):
     target = corpus[window_size:-window_size]
     contexts = []
 
-    for idx in range(window_size, len(corpus)-window_size):
+    for idx in range(window_size, len(corpus) - window_size):
         cs = []
         for t in range(-window_size, window_size + 1):
             if t == 0:
@@ -299,3 +300,37 @@ def normalize(x):
         s = np.sqrt((x * x).sum())
         x /= s
     return x
+
+
+def im2col(input_data, filter_h, filter_w, stride=1, pad=0):
+    N, C, H, W = input_data.shape
+    out_h = (H + 2 * pad - filter_h) // stride + 1
+    out_w = (W + 2 * pad - filter_w) // stride + 1
+
+    img = np.pad(input_data, [(0, 0), (0, 0), (pad, pad), (pad, pad)], 'constant')
+    col = np.zeros((N, C, filter_h, filter_w, out_h, out_w))
+
+    for y in range(filter_h):
+        y_max = y + stride * out_h
+        for x in range(filter_w):
+            x_max = x + stride * out_w
+            col[:, :, y, x, :, :] = img[:, :, y:y_max:stride, x:x_max:stride]
+
+    col = col.transpose(0, 4, 5, 1, 2, 3).reshape(N * out_h * out_w, -1)
+    return col
+
+
+def col2im(col, input_shape, filter_h, filter_w, stride=1, pad=0):
+    N, C, H, W = input_shape
+    out_h = (H + 2 * pad - filter_h) // stride + 1
+    out_w = (W + 2 * pad - filter_w) // stride + 1
+    col = col.reshape(N, out_h, out_w, C, filter_h, filter_w).transpose(0, 3, 4, 5, 1, 2)
+
+    img = np.zeros((N, C, H + 2 * pad + stride - 1, W + 2 * pad + stride - 1))
+    for y in range(filter_h):
+        y_max = y + stride * out_h
+        for x in range(filter_w):
+            x_max = x + stride * out_w
+            img[:, :, y:y_max:stride, x:x_max:stride] += col[:, :, y, x, :, :]
+
+    return img[:, :, pad:H + pad, pad:W + pad]

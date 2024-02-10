@@ -1,11 +1,15 @@
+import collections
 import os
 import pickle
 import sys
 
 import numpy as np
 
+from common.config import GPU
 from common.functions import sigmoid, softmax
 from common.gradient import numerical_gradient
+from common.layers import SigmoidWithLoss
+from common.time_layer import TimeEmbedding, TimeAffine, TimeSoftmaxWithLoss
 
 sys.path.append(os.pardir)
 
@@ -304,7 +308,7 @@ class SimpleCBOW:
         loss = self.loss_layer.forward(score, target)
         return loss
 
-    def backward(self, dout = 1):
+    def backward(self, dout=1):
         ds = self.loss_layer.backward(dout)
         da = self.out_layer.backward(ds)
 
@@ -312,3 +316,300 @@ class SimpleCBOW:
         self.in_layer1.backward(da)
         self.in_layer0.backward(da)
         return None
+
+
+class Embedding:
+    def __init__(self, W):
+        self.params = [W]
+        self.grads = [np.zeros_like(W)]
+        self.idx = None
+
+    def forward(self, index):
+        W, = self.params
+        self.idx = index
+        out = W[index]
+        return out
+
+    def backward(self, dout):
+        dW, = self.grads
+        dW[...] = 0
+
+        # for i, word_id in enumerate(self.idx):
+        #     dW[word_id] += dout[i]
+        np.add.at(dW, self.idx, dout)
+        return None
+
+
+class EmbeddingDot:
+    def __init__(self, W):
+        self.embed = Embedding(W)
+        self.params = self.embed.params
+        self.grads = self.embed.grads
+        self.cache = None
+
+    def forward(self, h, idx):
+        target_W = self.embed.forward(idx)
+        out = np.sum(target_W * h, axis=1)
+
+        self.cache = (h, target_W)
+        return out
+
+    def backward(self, dout):
+        h, target_W = self.cache
+        dout = dout.reshape(dout.shape[0], 1)
+
+        dtarget_W = dout * h
+        self.embed.backward(dtarget_W)
+        dh = dout * target_W
+        return dh
+
+
+class UnigramSampler:
+    def __init__(self, corpus, power, sample_size):
+        self.sample_size = sample_size
+        self.vocab_size = None
+        self.word_p = None
+
+        counts = collections.Counter()
+        for word_id in corpus:
+            counts[word_id] += 1
+
+        vocab_size = len(counts)
+        self.vocab_size = vocab_size
+
+        self.word_p = np.zeros(vocab_size)
+        for i in range(vocab_size):
+            self.word_p[i] = counts[i]
+
+        self.word_p = np.power(self.word_p, power)
+        self.word_p /= np.sum(self.word_p)
+
+    def get_negative_sample(self, target):
+        batch_size = target.shape[0]
+
+        if not GPU:
+            negative_sample = np.zeros((batch_size, self.sample_size), dtype=np.int32)
+
+            for i in range(batch_size):
+                p = self.word_p.copy()
+                target_idx = target[i]
+                p[target_idx] = 0
+                p /= p.sum()
+                negative_sample[i, :] = np.random.choice(self.vocab_size, size=self.sample_size, replace=False, p=p)
+        else:
+            # GPU(cupy）で計算するときは、速度を優先
+            # 負例にターゲットが含まれるケースがある
+            negative_sample = np.random.choice(self.vocab_size, size=(batch_size, self.sample_size),
+                                               replace=True, p=self.word_p)
+
+        return negative_sample
+
+
+class NegativeSamplingLoss:
+    def __init__(self, W, corpus, power=0.75, sample_size=5):
+        self.sample_size = sample_size
+        self.sampler = UnigramSampler(corpus, power, sample_size)
+        self.loss_layers = [SigmoidWithLoss() for _ in range(sample_size + 1)]
+        self.embed_dot_layers = [EmbeddingDot(W) for _ in range(sample_size + 1)]
+
+        self.params, self.grads = [], []
+        for layer in self.embed_dot_layers:
+            self.params += layer.params
+            self.grads += layer.grads
+
+    def forward(self, h, target):
+        batch_size = target.shape[0]
+        negative_sample = self.sampler.get_negative_sample(target)
+
+        # 긍정적 예 순전파
+        score = self.embed_dot_layers[0].forward(h, target)
+        correct_label = np.ones(batch_size, dtype=np.int32)
+        loss = self.loss_layers[0].forward(score, correct_label)
+
+        # 부정적 예 순전파
+        negative_label = np.zeros(batch_size, dtype=np.int32)
+        for i in range(self.sample_size):
+            negative_target = negative_sample[:, i]
+            score = self.embed_dot_layers[1 + i].forward(h, negative_target)
+            loss += self.loss_layers[1 + i].forward(score, negative_label)
+
+        return loss
+
+    def backward(self, dout=1):
+        dh = 0
+        for l0, l1 in zip(self.loss_layers, self.embed_dot_layers):
+            dscore = l0.backward(dout)
+            dh += l1.backward(dscore)
+
+        return dh
+
+
+class CBOW:
+    def __init__(self, vocab_size, hidden_size, window_size, corpus):
+        V, H = vocab_size, hidden_size
+
+        # Weight Initialisation
+        W_in = 0.01 * np.random.randn(V, H).astype('f')
+        W_out = 0.01 * np.random.randn(V, H).astype('f')
+
+        # Generate Layer
+        self.in_layers = []
+        for i in range(2 * window_size):
+            layer = Embedding(W_in)  # Using `Embedding` layer.
+            self.in_layers.append(layer)
+        self.ns_loss = NegativeSamplingLoss(W_out, corpus, power=0.75, sample_size=5)
+
+        # Collect every weight and coeffecient to array.
+        layers = self.in_layers + [self.ns_loss]
+        self.params, self.grads = [], []
+        for layer in layers:
+            self.params += layer.params
+            self.grads += layer.grads
+
+        # Save words' variable to instance variable.
+        self.word_vecs = W_in
+
+    def forward(self, contexts, target):
+        h = 0
+        for i, layer in enumerate(self.in_layers):
+            h += layer.forward(contexts[:, i])
+        h *= 1 / len(self.in_layers)
+        loss = self.ns_loss.forward(h, target)
+        return loss
+
+    def backward(self, dout=1):
+        dout = self.ns_loss.backward(dout)
+        dout *= 1 / len(self.in_layers)
+        for layer in self.in_layers:
+            layer.backward(dout)
+        return None
+
+
+class RNN:
+    def __init__(self, Wx, Wh, b):
+        self.params = [Wx, Wh, b]
+        self.grads = [np.zeros_like(Wx), np.zeros_like(Wh), np.zeros_like(b)]
+        self.cache = None
+
+    def forward(self, x, h_prev):
+        Wx, Wh, b = self.params
+        t = np.matmul(h_prev, Wh) + np.matmul(x, Wx) + b
+        h_next = np.tanh(t)
+
+        self.cache = (x, h_prev, h_next)
+        return h_next
+
+    def backward(self, dh_next):
+        Wx, Wh, b = self.params
+        x, h_prev, h_next = self.cache
+
+        dt = dh_next * (1 - h_next ** 2)
+        db = np.sum(dt, axis=0)
+        dWh = np.matmul(h_prev.T, dt)
+        dh_prev = np.matmul(dt, Wh.T)
+        dWx = np.matmul(x.T, dt)
+        dx = np.matmul(dt, Wx.T)
+
+        self.grads[0][...] = dWx
+        self.grads[1][...] = dWh
+        self.grads[2][...] = db
+
+        return dx, dh_prev
+
+
+class TimeRNN:
+    def __init__(self, Wx, Wh, b, stateful=False):
+        self.params = [Wx, Wh, b]
+        self.grads = [np.zeros_like(Wx), np.zeros_like(Wh), np.zeros_like(b)]
+        self.layers = None
+
+        self.h, self.dh = None, None
+        self.stateful = stateful
+
+    def set_state(self, h):
+        self.h = h
+
+    def reset_state(self):
+        self.h = None
+
+    def forward(self, xs):
+        Wx, Wh, b = self.params
+        N, T, D = xs.shape
+        D, H = Wx.shape
+
+        self.layers = []
+        hs = np.empty((N, T, D), dtype='f')
+
+        if not self.stateful or self.h is None:
+            self.h = np.zeros((N, H), dtype='f')
+
+        for t in range(T):
+            layer = RNN(*self.params)
+            self.h = layer.forward(xs[:, t, :], self.h)
+            hs[:, t, :] = self.h
+            self.layers.append(layer)
+
+        return hs
+
+    def backward(self, dhs):
+        Wx, Wh, b = self.params
+        N, T, H = dhs.shape
+        D, H = Wx.shape
+
+        dxs = np.empty((N, T, D), dtype='f')
+        dh = 0
+        grads = [0, 0, 0]
+        for t in reversed(range(T)):
+            layer = self.layers[t]
+            dx, dh = layer.backward(dhs[:, t, :] + dh)  # 합산된 기울기
+            dxs[:, t, :] = dx
+
+            for i, grad in enumerate(layer.grads):
+                grads[i] += grad
+
+        for i, grad in enumerate(grads):
+            self.grads[i][...] = grad
+        self.dh = dh
+
+        return dxs
+
+
+class SimpleRnnlm:
+    def __init__(self, vocab_size, wordvec_size, hidden_size):
+        V, D, H = vocab_size, wordvec_size, hidden_size
+        rn = np.random.randn
+
+        embed_W = (rn(V, D) / 100).astype('f')
+        rnn_Wx = (rn(D, H) / np.sqrt(D)).astype('f')
+        rnn_Wh = (rn(H, H) / np.sqrt(H)).astype('f')
+        rnn_b = np.zeros(H).astype('f')
+        affine_W = (rn(H, V) / np.sqrt(H)).astype('f')
+        affine_b = np.zeros(V).astype('f')
+
+        self.layers = [
+            TimeEmbedding(embed_W),
+            TimeRNN(rnn_Wx, rnn_Wh, rnn_b, stateful=True),
+            TimeAffine(affine_W, affine_b)
+        ]
+        self.loss_layer = TimeSoftmaxWithLoss()
+        self.rnn_layer = self.layers[1]
+
+        self.params, self.grads = [], []
+        for layer in self.layers:
+            self.params += layer.params
+            self.grads += layer.grads
+
+    def forward(self, xs, ts):
+        for layer in self.layers:
+            xs = layer.forward(xs)
+        loss = self.loss_layer.forward(xs, ts)
+        return loss
+
+    def backward(self, dout=1):
+        dout = self.loss_layer.backward(dout)
+        for layer in reversed(self.layers):
+            dout = layer.backward(dout)
+        return dout
+
+    def reset_state(self):
+        self.rnn_layer.reset_state()
